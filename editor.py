@@ -128,6 +128,24 @@ QCheckBox#check {
     color: #888;
     spacing: 5px;
 }
+QCheckBox#check::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid #666;
+    border-radius: 3px;
+    background: transparent;
+}
+QCheckBox#check::indicator:hover {
+    border-color: #888;
+}
+QCheckBox#check::indicator:checked {
+    background: #3a5a73;
+    border-color: #4a6f8a;
+    image: none;
+}
+QCheckBox#check:checked {
+    color: #b0b0b0;
+}
 QLineEdit#limit {
     background: transparent;
     color: #888;
@@ -231,7 +249,13 @@ class AutoResizingTextEdit(QPlainTextEdit):
         self._adjust_height()
 
     def _adjust_height(self) -> None:
-        doc_h = self.document().size().height()
+        doc = self.document()
+        layout = doc.documentLayout()
+        doc_h = 0.0
+        block = doc.begin()
+        while block.isValid():
+            doc_h += layout.blockBoundingRect(block).height()
+            block = block.next()
         fm = QFontMetrics(self.font())
         line_h = fm.lineSpacing()
         min_h = line_h * self._min_lines
@@ -415,12 +439,17 @@ def _sanitize_filename(name: str) -> str:
     return cleaned or "untitled"
 
 
-def _first_line(s: str) -> str:
-    for line in s.splitlines():
-        line = line.rstrip()
-        if line:
-            return line
-    return ""
+def _split_description(s: str) -> tuple[str, str]:
+    lines = s.splitlines()
+    head_idx = next((i for i, ln in enumerate(lines) if ln.rstrip()), -1)
+    if head_idx < 0:
+        return "", ""
+    head = lines[head_idx].rstrip()
+    rest_lines = lines[head_idx + 1:]
+    while rest_lines and not rest_lines[0].strip():
+        rest_lines.pop(0)
+    rest = "\n".join(rest_lines).rstrip()
+    return head, rest
 
 
 def _validate_data(raw) -> dict:
@@ -458,10 +487,13 @@ def _export_markdown(data: dict) -> str:
         parts.append(f"# {title}")
         parts.append("")
     for b in data["blocks"]:
-        head = _first_line(b.get("description", ""))
+        head, rest = _split_description(b.get("description", ""))
         body = b.get("content", "").rstrip()
         if head:
             parts.append(f"## {head}")
+            parts.append("")
+        if rest:
+            parts.append("\n".join(f"> {ln}" if ln else ">" for ln in rest.splitlines()))
             parts.append("")
         if body:
             parts.append(body)
@@ -477,10 +509,13 @@ def _export_text(data: dict) -> str:
         parts.append(RULE)
         parts.append("")
     for b in data["blocks"]:
-        head = _first_line(b.get("description", ""))
+        head, rest = _split_description(b.get("description", ""))
         body = b.get("content", "").rstrip()
         if head:
             parts.append(f"【{head}】")
+            parts.append("")
+        if rest:
+            parts.append("\n".join(f"│ {ln}" if ln else "│" for ln in rest.splitlines()))
             parts.append("")
         if body:
             parts.append(body)
