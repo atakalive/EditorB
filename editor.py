@@ -896,6 +896,7 @@ class EditorWindow(QMainWindow):
         discard_btn = box.addButton("保存しない", QMessageBox.ButtonRole.DestructiveRole)
         cancel_btn = box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(save_btn)
+        box.setEscapeButton(cancel_btn)
         box.exec()
         clicked = box.clickedButton()
         if clicked is save_btn:
