@@ -135,8 +135,11 @@ JIS 配列では `=` が `Shift+-` なので en dash の `Ctrl+-` と物理的�
 - `char_limit`: 0 = 上限なし、正の整数 = 上限値
 - `show_count`: 文字数表示の ON/OFF
 - `content`: 本文のプレーンテキスト。**常に**書く（可読性・エクスポート・破損時のフォールバック用）
-- `content_html`: 本文の書式付き HTML（`QTextDocumentFragment.toHtml()`）。
-  書式がある、またはソフト改行（U+2028）を含むブロックにだけ書く
+- `content_html`: 本文の書式付き HTML。書式がある、またはソフト改行（U+2028）を含む
+  ブロックにだけ書く。生成は `document().clone()` を `sanitize_document` してから
+  `QTextDocumentFragment.toHtml()`（`document().toHtml()` はフォントを焼き付けてズームを殺す）。
+  さらに Qt が先頭/末尾ブロックの `<li>`/`<p>` の内側に埋める `<!--StartFragment-->` /
+  `<!--EndFragment-->` を剥がす——残すと再読込の `setHtml` がリスト所属・段落インデントを落とす
 - `version`: どのブロックも `content_html` を必要としなければ `1` を書く
   （修飾を使っていないファイルは旧ビルドでも開ける）。読み込みは `1` / `2` の両方を受理
 - `content_html` が壊れている（キー無し / 非文字列 / 空白のみ / Qt が空文書に解釈する）場合は

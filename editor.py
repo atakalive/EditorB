@@ -563,6 +563,20 @@ def _word_ready_html(html: str) -> str:
     return _RE_STYLE_ATTR.sub(repl, html)
 
 
+def _strip_fragment_markers(html: str) -> str:
+    """QTextDocumentFragment.toHtml() が先頭/末尾の <li>/<p> の内側に埋め込む
+    <!--StartFragment--> / <!--EndFragment--> を除去する。
+
+    ⚠️ これを残したまま QTextDocument.setHtml() へ通すと、コメントが <li>/<p> の
+    内側にあるせいで Qt 6.11.0 が当該ブロックの list 所属（ObjectIndex）と
+    -qt-block-indent を落とす（＝保存→再読込・内部コピペでリストと段落インデントが
+    黙って全消失する）。setHtml へ渡す前と保存 HTML の生成時に必ず剥がす。
+    Word へのコピー経路（out.setHtml で載せるだけ・再パースしない）では剥がさない
+    ——Qt がこのコメントから CF_HTML のフラグメントオフセットを計算するため。
+    """
+    return html.replace("<!--StartFragment-->", "").replace("<!--EndFragment-->", "")
+
+
 def _selected_blocks(cur: QTextCursor) -> list:
     """選択にかかっているブロックの一覧。"""
     doc = cur.document()
@@ -862,8 +876,19 @@ class RichTextEdit(QTextEdit):
         src = super().createMimeDataFromSelection()
         out = QMimeData()
         if src.hasHtml():
-            # setHtml で載せ直すので Qt が CF_HTML のバイトオフセットを再計算する。
-            out.setHtml(_word_ready_html(src.html()))
+            # 選択フラグメントを scratch に取り込んで sanitize する。狙いは内部編集で
+            # 付いた block char format 由来の「style= を2つ持つ <li>」を潰すこと
+            # （Word / ブラウザは最初の style しか見ないので余白・インデントが落ちる）。
+            # 取り込み時は StartFragment を剥がさないとリスト所属が落ちるので剥がす。
+            scratch = QTextDocument()
+            scratch.setDefaultFont(self.document().defaultFont())
+            scratch.setIndentWidth(self.document().indentWidth())
+            scratch.setHtml(_strip_fragment_markers(src.html()))
+            sanitize_document(scratch, map_margins=False)
+            # 再直列化で StartFragment が付き直る。out.setHtml で載せ直すので Qt が
+            # CF_HTML のバイトオフセットを再計算する（この経路ではマーカーを残す）。
+            html = _word_ready_html(QTextDocumentFragment(scratch).toHtml())
+            out.setHtml(html)
         # text/plain は必須（メモ帳・Paste Special・ターミナル用）。
         out.setText(src.text())
         return out
@@ -887,7 +912,9 @@ class RichTextEdit(QTextEdit):
             scratch.setDefaultFont(self.document().defaultFont())
             # 余白 -> 段数変換の基準を揃える
             scratch.setIndentWidth(self.document().indentWidth())
-            scratch.setHtml(source.html())
+            # StartFragment コメントを剥がしてから setHtml（内部コピペで我々自身が
+            # 載せたフラグメント HTML はこれを含み、残すとリスト所属が落ちる）。
+            scratch.setHtml(_strip_fragment_markers(source.html()))
             sanitize_document(scratch)
             cur.beginEditBlock()
             cur.insertFragment(QTextDocumentFragment(scratch))
@@ -1246,9 +1273,15 @@ class BlockWidget(QFrame):
         doc = self.content.document()
         # 書式もソフト改行も無いブロックでは HTML を作らない（v1 とバイト単位で同一になる）。
         if _needs_html(doc):
-            # document().toHtml() だとフォントが全 char format に焼き付いてズームが死ぬ。
-            # 必ずフラグメント形式で保存する。
-            d["content_html"] = QTextDocumentFragment(doc).toHtml()
+            # ⚠️ ライブ doc をそのまま toHtml すると (1) 内部編集で付いた block char format
+            #    が style= を2つ持つ不正な <li> を生む、(2) StartFragment コメントが再読込で
+            #    リストを落とす。clone() を sanitize してから直列化し、マーカーを剥がす。
+            #    document().toHtml() はフォントを焼き付けてズームを殺すので使わない（前提4）。
+            scratch = doc.clone()
+            sanitize_document(scratch, map_margins=False)
+            d["content_html"] = _strip_fragment_markers(
+                QTextDocumentFragment(scratch).toHtml()
+            )
         d["char_limit"] = max(0, limit)
         d["show_count"] = self.cb_show.isChecked()
         return d
@@ -1285,8 +1318,10 @@ class BlockWidget(QFrame):
         try:
             if isinstance(html, str) and html.strip():
                 # ウィジェット側の setHtml を使う（QTextDocument.setHtml は
-                # isModified() を True のままにする）。
-                self.content.setHtml(html)
+                # isModified() を True のままにする）。StartFragment コメントは
+                # setHtml がリスト所属を落とす原因になるので剥がしてから通す
+                # （旧ビルドが保存したファイル・手編集ファイルへの防御）。
+                self.content.setHtml(_strip_fragment_markers(html))
                 # 読み込み時のサニタイズは必須。前提となるフォント焼き付きと、
                 # setHtml が <p> に注入する 12px の段落余白を同時に潰す。
                 sanitize_document(doc)
