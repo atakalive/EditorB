@@ -487,6 +487,9 @@ def _export_markdown(data: dict) -> str:
         parts.append(f"# {title}")
         parts.append("")
     for b in data["blocks"]:
+        # 出力は description / content だけから作られるので、両方空ならスキップ。
+        if not b.get("description", "").strip() and not b.get("content", "").strip():
+            continue
         head, rest = _split_description(b.get("description", ""))
         body = b.get("content", "").rstrip()
         if head:
@@ -509,6 +512,10 @@ def _export_text(data: dict) -> str:
         parts.append(RULE)
         parts.append("")
     for b in data["blocks"]:
+        # 出力は description / content だけから作られるので、両方空ならスキップ。
+        # （残すと罫線が2本連続する）
+        if not b.get("description", "").strip() and not b.get("content", "").strip():
+            continue
         head, rest = _split_description(b.get("description", ""))
         body = b.get("content", "").rstrip()
         if head:
@@ -580,7 +587,8 @@ class EditorWindow(QMainWindow):
         self.btn_add.setObjectName("btn_add")
         self.btn_add.setToolTip("ブロック追加")
         self.btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_add.clicked.connect(self.add_block)
+        # NOTE: clicked(bool) を位置引数で受けないよう lambda で吸収する。
+        self.btn_add.clicked.connect(lambda _checked=False: self.add_block())
         h_layout.addWidget(self.title_edit, 1)
         h_layout.addWidget(self.btn_add, 0)
         root.addWidget(header)
@@ -628,6 +636,14 @@ class EditorWindow(QMainWindow):
         sc("Ctrl+-", self.action_insert_en_dash)
         sc("Ctrl++", self.action_zoom_in)
         sc("Ctrl+=", self.action_zoom_in)
+        # ブロック操作。Windows の標準バインドは Cut=Shift+Del / Paste=Shift+Ins /
+        # Copy=Ctrl+Ins なので、Ctrl を1つでも外すと切り取り・貼り付け・コピーに化ける。
+        # Ctrl+Shift の組み合わせであることが QWidgetTextControl の ShortcutOverride を
+        # 避ける条件でもあるため、修飾キーを減らさないこと。
+        sc("Ctrl+Shift+Up", self.action_move_current_block_up)
+        sc("Ctrl+Shift+Down", self.action_move_current_block_down)
+        sc("Ctrl+Shift+Delete", self.action_delete_current_block).setAutoRepeat(False)
+        sc("Ctrl+Shift+Insert", self.action_insert_block_below).setAutoRepeat(False)
 
     # ---------- fonts ----------
     def _ui_font(self) -> QFont:
@@ -658,29 +674,154 @@ class EditorWindow(QMainWindow):
             b.apply_font(ui, content)
 
     # ---------- block management ----------
-    def add_block(self, initial: bool = False) -> BlockWidget:
+    def add_block(self, initial: bool = False, index: Optional[int] = None) -> BlockWidget:
+        # initial は第1引数のまま保つこと（引数順を入れ替えると ＋ ボタンが壊れる）。
         block = BlockWidget()
         block.apply_font(self._ui_font(), self._content_font())
-        # insert before trailing stretch
-        self.column_layout.insertWidget(self.column_layout.count() - 1, block)
-        self.blocks.append(block)
+        # 有効域は 0 <= pos <= len(self.blocks) の閉区間。負値や超過を渡すと
+        # trailing stretch の後ろに入って不変条件が壊れる。
+        pos = len(self.blocks) if index is None else max(0, min(int(index), len(self.blocks)))
+        self.column_layout.insertWidget(pos, block)
+        self.blocks.insert(pos, block)
         block.changed.connect(self._mark_dirty)
+        self._rebuild_tab_order()
         if not initial:
             self._mark_dirty()
-            QApplication.processEvents()
-            self.scroll.verticalScrollBar().setValue(
-                self.scroll.verticalScrollBar().maximum()
-            )
             block.content.setFocus()
+            self._reveal(block.content)
         return block
 
+    def _destroy_block(self, block: BlockWidget) -> None:
+        """ブロック1個の解体。self.blocks には触れない。"""
+        self.column_layout.removeWidget(block)
+        block.changed.disconnect(self._mark_dirty)
+        block.setParent(None)
+        block.deleteLater()
+
     def _clear_blocks(self) -> None:
-        for b in self.blocks:
-            self.column_layout.removeWidget(b)
-            b.changed.disconnect(self._mark_dirty)
-            b.setParent(None)
-            b.deleteLater()
+        for b in list(self.blocks):
+            self._destroy_block(b)
         self.blocks.clear()
+
+    def _active_block(self) -> Optional[BlockWidget]:
+        """フォーカス中ウィジェットを子孫に持つブロック。無ければ None。"""
+        fw = QApplication.focusWidget()
+        return next((b for b in self.blocks if b.isAncestorOf(fw)), None)
+
+    def _rebuild_tab_order(self) -> None:
+        """Tab フォーカス順を画面（レイアウト）順に張り直す。"""
+        # btn_add / scroll を明示的に含めないと、setTabOrder の再挿入で
+        # 両者がチェーン末尾へ押し出され既存の Tab 動作が退行する。
+        chain: list[QWidget] = [self.title_edit, self.btn_add, self.scroll]
+        for b in self.blocks:
+            chain += [b.description, b.content, b.cb_show, b.ed_limit]
+        for prev, nxt in zip(chain, chain[1:]):
+            QWidget.setTabOrder(prev, nxt)
+
+    def _reveal(self, widget: QWidget) -> None:
+        """レイアウトを同期確定させてから widget を可視域へスクロールする。"""
+        self.column_layout.activate()
+        self.scroll.widget().layout().activate()
+        self.scroll.ensureWidgetVisible(widget, 0, 24)
+
+    def _block_is_empty(self, block: BlockWidget) -> bool:
+        d = block.to_dict()
+        return (
+            not d["description"].strip()
+            and not d["content"].strip()
+            and d["char_limit"] == 0
+            and not d["show_count"]
+        )
+
+    def _block_preview(self, block: BlockWidget) -> str:
+        d = block.to_dict()
+        head, _ = _split_description(d["description"])
+        s = head or d["content"]
+        s = " ".join(s.split())
+        if not s:
+            return "（未入力のブロック）"
+        return s[:30] + "…" if len(s) > 30 else s
+
+    def _confirm_delete_block(self, block: BlockWidget) -> bool:
+        if self._block_is_empty(block):
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText("このブロックを削除しますか？")
+        box.setInformativeText(self._block_preview(block))
+        # QTranslator を入れていないため StandardButton は英語表記になる。addButton を使う。
+        del_btn = box.addButton("削除", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        result = box.clickedButton() is del_btn
+        box.deleteLater()
+        return result
+
+    def action_move_current_block_up(self) -> None:
+        self._move_current_block(-1)
+
+    def action_move_current_block_down(self) -> None:
+        self._move_current_block(+1)
+
+    def _move_current_block(self, delta: int) -> None:
+        QApplication.inputMethod().commit()
+        block = self._active_block()
+        if block is None:
+            return
+        i = self.blocks.index(block)
+        j = i + delta
+        if j < 0 or j >= len(self.blocks):
+            return
+        saved = QApplication.focusWidget()
+        self.blocks[i], self.blocks[j] = self.blocks[j], self.blocks[i]
+        self.column_layout.removeWidget(block)
+        self.column_layout.insertWidget(j, block)
+        self._mark_dirty()
+        self._rebuild_tab_order()
+        if saved is not None and QApplication.focusWidget() is not saved:
+            saved.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._reveal(saved or block.content)
+
+    def action_delete_current_block(self) -> None:
+        QApplication.inputMethod().commit()
+        block = self._active_block()
+        if block is None:
+            return
+        if len(self.blocks) == 1:
+            # 「ブロックは常に1個以上」を保つため、破棄せずその場で空にリセットする。
+            if self._block_is_empty(block):
+                return
+            if self._confirm_delete_block(block):
+                block.load_from_dict({})
+                self._mark_dirty()
+                block.content.setFocus()
+            return
+        if not self._confirm_delete_block(block):
+            return
+        try:
+            i = self.blocks.index(block)
+        except ValueError:
+            return
+        neighbor = self.blocks[i + 1] if i + 1 < len(self.blocks) else self.blocks[i - 1]
+        # 破棄より先にフォーカスを移す（後だと勝手に別ブロックへ飛んでビューが跳ねる）。
+        neighbor.content.setFocus()
+        self.blocks.pop(i)
+        self._destroy_block(block)
+        self._rebuild_tab_order()
+        self._mark_dirty()
+        self._reveal(neighbor.content)
+
+    def action_insert_block_below(self) -> None:
+        QApplication.inputMethod().commit()
+        block = self._active_block()
+        if block is not None:
+            self.add_block(index=self.blocks.index(block) + 1)
+        else:
+            self.add_block()
 
     # ---------- dirty / status ----------
     def _snapshot(self) -> str:
@@ -735,6 +876,8 @@ class EditorWindow(QMainWindow):
                 block.changed.connect(self._mark_dirty)
         finally:
             self._loading = False
+        # _clear_blocks で全ブロックを破棄しているのでチェーンを張り直す。
+        self._rebuild_tab_order()
         self._saved_snapshot = self._snapshot()
         self.dirty = False
         self._update_status()
@@ -801,6 +944,8 @@ class EditorWindow(QMainWindow):
         self.dirty = False
         self._update_status()
         self._update_window_title()
+        if self.blocks:
+            self.blocks[0].content.setFocus()
 
     def action_save(self) -> bool:
         if self.current_path is None:
