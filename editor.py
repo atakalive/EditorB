@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -69,6 +69,8 @@ INDENT_MAX = 6
 WORD_INDENT_PT = 24
 DIRTY_DEBOUNCE_MS = 300
 BAR_DELAY_MS = 120
+REVEAL_MARGIN = 24   # ブロック表示時の上下マージン
+CARET_MARGIN = 8     # キャレット表示時の上下マージン
 
 # 文字数カウントから除外する文字。toPlainText() は U+2028 / U+2029 を "\n" に
 # 正規化するので、ここで指定するのは改行と OBJECT REPLACEMENT CHARACTER だけでよい。
@@ -305,6 +307,8 @@ def _repolish(w: QWidget) -> None:
 class AutoResizingTextEdit(QPlainTextEdit):
     """QPlainTextEdit that grows to fit its content."""
 
+    caret_moved = Signal()
+
     def __init__(
         self,
         min_lines: int,
@@ -329,6 +333,11 @@ class AutoResizingTextEdit(QPlainTextEdit):
             lambda _=None: self._adjust_height()
         )
         self._adjust_height()
+
+    def inputMethodEvent(self, event) -> None:  # noqa: N802
+        # IME 変換中は cursorPositionChanged が出ないので、確定後の矩形を拾う。
+        super().inputMethodEvent(event)
+        self.caret_moved.emit()
 
     def setFont(self, font: QFont) -> None:  # noqa: N802
         super().setFont(font)
@@ -608,6 +617,7 @@ class RichTextEdit(QTextEdit):
     """本文用のリッチテキスト欄。自動伸長し、Word と往復できる範囲の書式だけを扱う。"""
 
     escape_pressed = Signal()
+    caret_moved = Signal()
 
     # (メソッド名, ラベル, ツールチップ, ボタンの objectName or None)
     COMMANDS = (
@@ -943,6 +953,11 @@ class RichTextEdit(QTextEdit):
         menu.deleteLater()
 
     # ---------- キー入力 ----------
+    def inputMethodEvent(self, event) -> None:  # noqa: N802
+        # IME 変換中は cursorPositionChanged が出ないので、確定後の矩形を拾う。
+        super().inputMethodEvent(event)
+        self.caret_moved.emit()
+
     def keyPressEvent(self, e) -> None:  # noqa: N802
         # Tab / Shift+Tab はショートカットより先に Qt がフォーカス移動として解決するので
         # ここで処理する（Shift+Tab は Key_Backtab として届く）。
@@ -1152,15 +1167,15 @@ class BlockWidget(QFrame):
         )
 
         # description area wrapper (for padding via QSS)
-        desc_area = QFrame()
-        desc_area.setObjectName("description_area")
-        desc_layout = QVBoxLayout(desc_area)
+        self.desc_area = QFrame()
+        self.desc_area.setObjectName("description_area")
+        desc_layout = QVBoxLayout(self.desc_area)
         desc_layout.setContentsMargins(16, 10, 16, 10)
         desc_layout.addWidget(self.description)
 
-        content_area = QFrame()
-        content_area.setObjectName("content_area")
-        c_layout = QVBoxLayout(content_area)
+        self.content_area = QFrame()
+        self.content_area.setObjectName("content_area")
+        c_layout = QVBoxLayout(self.content_area)
         c_layout.setContentsMargins(16, 16, 16, 16)
         c_layout.addWidget(self.content)
 
@@ -1204,8 +1219,8 @@ class BlockWidget(QFrame):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(desc_area)
-        outer.addWidget(content_area)
+        outer.addWidget(self.desc_area)
+        outer.addWidget(self.content_area)
         outer.addWidget(self.footer)
 
         # signals
@@ -1215,6 +1230,19 @@ class BlockWidget(QFrame):
         self.ed_limit.textChanged.connect(self._on_changed)
 
         self._refresh_counter()
+
+    def settle_layout(self) -> None:
+        """内側 -> 外側の順にレイアウトを確定し、sizeHint を最新にする。
+
+        自動伸長エディタの setFixedHeight は親の sizeHint キャッシュを非同期にしか
+        更新しないので、updateGeometry でキャッシュを捨ててから内側の area を
+        activate する。ここを省くと大量ペースト後にスクロール範囲が伸びない。
+        """
+        self.description.updateGeometry()
+        self.content.updateGeometry()
+        for area in (self.desc_area, self.content_area, self.footer):
+            area.layout().activate()
+        self.layout().activate()
 
     def _on_content_changed(self) -> None:
         self._refresh_counter()
@@ -1613,12 +1641,15 @@ class EditorWindow(QMainWindow):
         if not initial:
             self._mark_dirty()
             block.content.setFocus()
-            self._reveal(block.content)
+            self._reveal(block)
         return block
 
     def _attach_block(self, block: BlockWidget) -> None:
         """新しく画面に載せたブロックの配線。add_block / _load_data の共通処理。"""
         block.changed.connect(self._mark_dirty)
+        for ed in (block.content, block.description):
+            ed.cursorPositionChanged.connect(self._on_caret_moved)
+            ed.caret_moved.connect(self._on_caret_moved)
 
     def _destroy_block(self, block: BlockWidget) -> None:
         """ブロック1個の解体。self.blocks には触れない。"""
@@ -1626,8 +1657,18 @@ class EditorWindow(QMainWindow):
         self.format_bar.detach_if(block.content)
         self.column_layout.removeWidget(block)
         block.changed.disconnect(self._mark_dirty)
+        for ed in (block.content, block.description):
+            ed.cursorPositionChanged.disconnect(self._on_caret_moved)
+            ed.caret_moved.disconnect(self._on_caret_moved)
         block.setParent(None)
         block.deleteLater()
+
+    def _on_caret_moved(self) -> None:
+        if self._loading:
+            return
+        editor = self.sender()
+        if isinstance(editor, (RichTextEdit, AutoResizingTextEdit)):
+            self._reveal_caret(editor)
 
     def _clear_blocks(self) -> None:
         for b in list(self.blocks):
@@ -1649,11 +1690,72 @@ class EditorWindow(QMainWindow):
         for prev, nxt in zip(chain, chain[1:]):
             QWidget.setTabOrder(prev, nxt)
 
-    def _reveal(self, widget: QWidget) -> None:
-        """レイアウトを同期確定させてから widget を可視域へスクロールする。"""
+    def _settle_layout(self, block: Optional[BlockWidget] = None) -> None:
+        """ジオメトリとスクロール範囲を同期確定させる。
+
+        block 指定時はその1個だけ settle する（打鍵ごとの caret 追従用に軽くする）。
+        None なら全ブロック。
+        """
+        for b in (self.blocks if block is None else [block]):
+            if b.isHidden():
+                b.show()              # レイアウトに載せるまでは isEmpty 扱いで無視される
+            b.settle_layout()
         self.column_layout.activate()
-        self.scroll.widget().layout().activate()
-        self.scroll.ensureWidgetVisible(widget, 0, 24)
+        QApplication.sendEvent(self.scroll, QEvent(QEvent.Type.LayoutRequest))
+        self.column_layout.activate()  # inner のリサイズ結果を列レイアウトへ反映
+
+    def _content_top(self, w: QWidget) -> int:
+        """スクロール内容座標（inner ウィジェット基準）での w の上端 y。"""
+        return w.mapTo(self.scroll.widget(), QPoint(0, 0)).y()
+
+    def _scroll_to_show(self, top: int, bottom: int, margin: int) -> None:
+        """[top, bottom]（内容座標）が見えるよう最小限だけ動かす。
+
+        対象範囲が viewport より高くて両立できないときは上端を優先する（下端は見切れる）。
+        range 外の値は QAbstractSlider(setValue) が自動クランプする。
+        """
+        bar = self.scroll.verticalScrollBar()
+        vh = self.scroll.viewport().height()
+        v = bar.value()
+        if bottom + margin > v + vh:
+            v = bottom + margin - vh
+        if top - margin < v:
+            v = top - margin
+        bar.setValue(v)
+
+    def _block_of(self, w: QWidget) -> Optional[BlockWidget]:
+        """w を含む（または w 自身の）ブロック。無ければ None。"""
+        return next((b for b in self.blocks if b is w or b.isAncestorOf(w)), None)
+
+    def _reveal(self, block: BlockWidget) -> None:
+        """全ブロックを settle してから、対象ブロック矩形を最小移動で可視化する。
+
+        ブロックが viewport に収まるときは上下 REVEAL_MARGIN 付きで完全可視。
+        viewport より高いときは上端優先（先頭が見え、下端は見切れる）。
+        """
+        self._settle_layout()
+        top = self._content_top(block)
+        self._scroll_to_show(top, top + block.height(), REVEAL_MARGIN)
+
+    def _reveal_caret(self, editor: QWidget) -> None:
+        """editor の属するブロックだけ settle し、キャレットを最小移動で可視化する。"""
+        block = self._block_of(editor)
+        if block is None:
+            return
+        self._settle_layout(block)
+        vp = editor.viewport()
+        cr = editor.cursorRect()            # editor viewport 座標のキャレット矩形
+        top = vp.mapTo(self.scroll.widget(), cr.topLeft()).y()
+        bottom = vp.mapTo(self.scroll.widget(), cr.bottomLeft()).y()
+        self._scroll_to_show(top, bottom, CARET_MARGIN)
+
+    def _topmost_visible_block(self) -> Optional[BlockWidget]:
+        """ビューポート上端に最も近い、少しでも可視なブロック（ズームのアンカー）。"""
+        v = self.scroll.verticalScrollBar().value()
+        for b in self.blocks:
+            if self._content_top(b) + b.height() > v:
+                return b
+        return self.blocks[-1] if self.blocks else None
 
     def _block_is_empty(self, block: BlockWidget) -> bool:
         d = block.to_dict()
@@ -1717,7 +1819,7 @@ class EditorWindow(QMainWindow):
         self._rebuild_tab_order()
         if saved is not None and QApplication.focusWidget() is not saved:
             saved.setFocus(Qt.FocusReason.OtherFocusReason)
-        self._reveal(saved or block.content)
+        self._reveal(block)
 
     def action_delete_current_block(self) -> None:
         QApplication.inputMethod().commit()
@@ -1732,6 +1834,7 @@ class EditorWindow(QMainWindow):
                 block.load_from_dict({})
                 self._mark_dirty()
                 block.content.setFocus()
+                self._reveal(block)
             return
         if not self._confirm_delete_block(block):
             return
@@ -1746,7 +1849,7 @@ class EditorWindow(QMainWindow):
         self._destroy_block(block)
         self._rebuild_tab_order()
         self._mark_dirty()
-        self._reveal(neighbor.content)
+        self._reveal_caret(neighbor.content)
 
     def action_insert_block_below(self) -> None:
         QApplication.inputMethod().commit()
@@ -1833,6 +1936,8 @@ class EditorWindow(QMainWindow):
         self.dirty = False
         self._update_status()
         self._update_window_title()
+        self._settle_layout()
+        self.scroll.verticalScrollBar().setValue(0)
 
     # ---------- actions ----------
     def _confirm_discard(self) -> Optional[bool]:
@@ -1972,9 +2077,16 @@ class EditorWindow(QMainWindow):
     def _set_zoom(self, pt: int) -> None:
         pt = max(FONT_MIN_PT, min(FONT_MAX_PT, pt))
         if pt == self.base_pt:
-            return
+            return                       # 上限/下限連打はここで抜けるのでずれ 0
+        anchor = self._topmost_visible_block()
+        keep = (self._content_top(anchor) - self.scroll.verticalScrollBar().value()
+                if anchor is not None else 0)   # アンカーの画面上 y（負もありうる）
         self.base_pt = pt
         self._apply_fonts()
+        self._settle_layout()
+        if anchor is not None:
+            # desired が range 内なら画面上 y を維持。range 外は setValue がクランプする。
+            self.scroll.verticalScrollBar().setValue(self._content_top(anchor) - keep)
         self.format_bar.reposition()
 
     def action_insert_en_dash(self) -> None:
