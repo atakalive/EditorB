@@ -759,6 +759,10 @@ class RichTextEdit(QTextEdit):
         cur.mergeCharFormat(fmt)
         cur.endEditBlock()
         self.mergeCurrentCharFormat(fmt)
+        # 書式は文字位置を動かさず cursorPositionChanged が出ないので、
+        # 折り返し変化でキャレットが画面外に出ても外側がスクロール追従しない。
+        # 明示的に caret_moved を出して _reveal_caret を走らせる。
+        self.caret_moved.emit()
 
     def toggle_bold(self) -> None:
         f = QTextCharFormat()
@@ -803,6 +807,7 @@ class RichTextEdit(QTextEdit):
             cur.setCharFormat(blank)
             cur.endEditBlock()
         self.setCurrentCharFormat(blank)
+        self.caret_moved.emit()   # 書式操作のキャレット追従（_merge_char と同じ理由）
 
     # ---------- リスト / インデント ----------
     def _span_cursor(self, blocks: list) -> QTextCursor:
@@ -838,6 +843,7 @@ class RichTextEdit(QTextEdit):
             _normalize_lists(doc)
         finally:
             cur.endEditBlock()
+        self.caret_moved.emit()   # リスト化は行を折り返す→キャレット追従（_merge_char と同じ理由）
 
     def toggle_bullet_list(self) -> None:
         self._toggle_list(QTextListFormat.Style.ListDisc)
@@ -874,6 +880,7 @@ class RichTextEdit(QTextEdit):
             _normalize_lists(doc)
         finally:
             cur.endEditBlock()
+        self.caret_moved.emit()   # インデントは折り返しを増やす→キャレット追従（_merge_char と同じ理由）
 
     def indent_more(self) -> None:
         self._change_indent(+1)
