@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -69,6 +69,10 @@ INDENT_MAX = 6
 WORD_INDENT_PT = 24
 DIRTY_DEBOUNCE_MS = 300
 BAR_DELAY_MS = 120
+# スクロールで可視域へ入れるときの余白。ブロック全体を見せるときと、
+# キャレットだけを見せるとき（打鍵ごとなので小さく）で使い分ける。
+REVEAL_MARGIN = 24
+CARET_MARGIN = 8
 
 # 文字数カウントから除外する文字。toPlainText() は U+2028 / U+2029 を "\n" に
 # 正規化するので、ここで指定するのは改行と OBJECT REPLACEMENT CHARACTER だけでよい。
@@ -305,6 +309,8 @@ def _repolish(w: QWidget) -> None:
 class AutoResizingTextEdit(QPlainTextEdit):
     """QPlainTextEdit that grows to fit its content."""
 
+    caret_moved = Signal()
+
     def __init__(
         self,
         min_lines: int,
@@ -340,6 +346,16 @@ class AutoResizingTextEdit(QPlainTextEdit):
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
         self._adjust_height()
+
+    def inputMethodEvent(self, e) -> None:  # noqa: N802
+        # IME の変換中（preedit）は cursorPositionChanged が出ない。ここで拾わないと
+        # 変換文字列が伸びて画面外へ出てもスクロールが追わない。
+        # ⚠️ 中身が空のイベントで emit してはいけない。Windows は変換を Esc で取り消すと
+        # preedit も commit も持たない QInputMethodEvent を送るので、無条件に emit すると
+        # 「変換中にホイールで別の場所を見て Esc」でビューがキャレットへ引き戻される。
+        super().inputMethodEvent(e)
+        if e.preeditString() or e.commitString():
+            self.caret_moved.emit()
 
     def _adjust_height(self) -> None:
         doc = self.document()
@@ -608,6 +624,7 @@ class RichTextEdit(QTextEdit):
     """本文用のリッチテキスト欄。自動伸長し、Word と往復できる範囲の書式だけを扱う。"""
 
     escape_pressed = Signal()
+    caret_moved = Signal()
 
     # (メソッド名, ラベル, ツールチップ, ボタンの objectName or None)
     COMMANDS = (
@@ -749,6 +766,7 @@ class RichTextEdit(QTextEdit):
         cur.mergeCharFormat(fmt)
         cur.endEditBlock()
         self.mergeCurrentCharFormat(fmt)
+        self.caret_moved.emit()
 
     def toggle_bold(self) -> None:
         f = QTextCharFormat()
@@ -793,6 +811,7 @@ class RichTextEdit(QTextEdit):
             cur.setCharFormat(blank)
             cur.endEditBlock()
         self.setCurrentCharFormat(blank)
+        self.caret_moved.emit()
 
     # ---------- リスト / インデント ----------
     def _span_cursor(self, blocks: list) -> QTextCursor:
@@ -828,6 +847,10 @@ class RichTextEdit(QTextEdit):
             _normalize_lists(doc)
         finally:
             cur.endEditBlock()
+        # 書式コマンドはドキュメント上のカーソル位置を動かさないので
+        # cursorPositionChanged が出ない。一方でリスト化・インデントは折り返しと
+        # 高さを変えるため、キャレットが画面外へ出うる。ここで追従を促す。
+        self.caret_moved.emit()
 
     def toggle_bullet_list(self) -> None:
         self._toggle_list(QTextListFormat.Style.ListDisc)
@@ -864,6 +887,7 @@ class RichTextEdit(QTextEdit):
             _normalize_lists(doc)
         finally:
             cur.endEditBlock()
+        self.caret_moved.emit()          # 理由は _toggle_list と同じ
 
     def indent_more(self) -> None:
         self._change_indent(+1)
@@ -958,6 +982,16 @@ class RichTextEdit(QTextEdit):
             # バーを隠すが accept せず伝播させる。
             self.escape_pressed.emit()
         super().keyPressEvent(e)
+
+    def inputMethodEvent(self, e) -> None:  # noqa: N802
+        # IME の変換中（preedit）は cursorPositionChanged が出ない。ここで拾わないと
+        # 変換文字列が伸びて画面外へ出てもスクロールが追わない。
+        # ⚠️ 中身が空のイベントで emit してはいけない。Windows は変換を Esc で取り消すと
+        # preedit も commit も持たない QInputMethodEvent を送るので、無条件に emit すると
+        # 「変換中にホイールで別の場所を見て Esc」でビューがキャレットへ引き戻される。
+        super().inputMethodEvent(e)
+        if e.preeditString() or e.commitString():
+            self.caret_moved.emit()
 
 
 class FormatBar(QFrame):
@@ -1152,15 +1186,16 @@ class BlockWidget(QFrame):
         )
 
         # description area wrapper (for padding via QSS)
-        desc_area = QFrame()
-        desc_area.setObjectName("description_area")
-        desc_layout = QVBoxLayout(desc_area)
+        # ⚠️ desc_area / content_area は settle_layout が内側から activate するために保持する。
+        self.desc_area = QFrame()
+        self.desc_area.setObjectName("description_area")
+        desc_layout = QVBoxLayout(self.desc_area)
         desc_layout.setContentsMargins(16, 10, 16, 10)
         desc_layout.addWidget(self.description)
 
-        content_area = QFrame()
-        content_area.setObjectName("content_area")
-        c_layout = QVBoxLayout(content_area)
+        self.content_area = QFrame()
+        self.content_area.setObjectName("content_area")
+        c_layout = QVBoxLayout(self.content_area)
         c_layout.setContentsMargins(16, 16, 16, 16)
         c_layout.addWidget(self.content)
 
@@ -1204,8 +1239,8 @@ class BlockWidget(QFrame):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(desc_area)
-        outer.addWidget(content_area)
+        outer.addWidget(self.desc_area)
+        outer.addWidget(self.content_area)
         outer.addWidget(self.footer)
 
         # signals
@@ -1254,6 +1289,20 @@ class BlockWidget(QFrame):
         if self.lbl_count.property("over") != over:
             self.lbl_count.setProperty("over", over)
             _repolish(self.lbl_count)
+
+    def settle_layout(self) -> None:
+        """内側 -> 外側の順にレイアウトを確定させ、sizeHint を最新にする。
+
+        ⚠️ 順序が load-bearing。自動伸長エディタの setFixedHeight は親の sizeHint
+        キャッシュを非同期にしか更新しないので、updateGeometry でキャッシュを捨ててから
+        内側の area を activate する。self.layout().activate() だけでは足りず、
+        大量ペースト後にブロック枠が伸びない（＝スクロール範囲も伸びない）ままになる。
+        """
+        self.description.updateGeometry()
+        self.content.updateGeometry()
+        for area in (self.desc_area, self.content_area, self.footer):
+            area.layout().activate()
+        self.layout().activate()
 
     def apply_font(self, ui_font: QFont, content_font: QFont) -> None:
         self.description.setFont(content_font)
@@ -1613,12 +1662,19 @@ class EditorWindow(QMainWindow):
         if not initial:
             self._mark_dirty()
             block.content.setFocus()
-            self._reveal(block.content)
+            self._reveal(block)
         return block
 
     def _attach_block(self, block: BlockWidget) -> None:
         """新しく画面に載せたブロックの配線。add_block / _load_data の共通処理。"""
         block.changed.connect(self._mark_dirty)
+        # キャレット追従は2経路で拾う。cursorPositionChanged が打鍵・貼り付け・
+        # Undo・ショートカット挿入（Ctrl+Shift+V / Ctrl+-）を、caret_moved が
+        # IME 変換中（preedit）と書式コマンドをカバーする。書式コマンドは
+        # ドキュメント上のカーソル位置を動かさないので前者は発火しない。
+        for ed in (block.description, block.content):
+            ed.cursorPositionChanged.connect(self._on_caret_moved)
+            ed.caret_moved.connect(self._on_caret_moved)
 
     def _destroy_block(self, block: BlockWidget) -> None:
         """ブロック1個の解体。self.blocks には触れない。"""
@@ -1626,6 +1682,9 @@ class EditorWindow(QMainWindow):
         self.format_bar.detach_if(block.content)
         self.column_layout.removeWidget(block)
         block.changed.disconnect(self._mark_dirty)
+        for ed in (block.description, block.content):
+            ed.cursorPositionChanged.disconnect(self._on_caret_moved)
+            ed.caret_moved.disconnect(self._on_caret_moved)
         block.setParent(None)
         block.deleteLater()
 
@@ -1649,11 +1708,144 @@ class EditorWindow(QMainWindow):
         for prev, nxt in zip(chain, chain[1:]):
             QWidget.setTabOrder(prev, nxt)
 
-    def _reveal(self, widget: QWidget) -> None:
-        """レイアウトを同期確定させてから widget を可視域へスクロールする。"""
+    # ---------- scroll ----------
+    def _settle_layout(self, block: Optional[BlockWidget] = None) -> None:
+        """ジオメトリとスクロール範囲を同期確定させる。
+
+        これを挟まずにスクロール位置を計算すると、1〜2フレーム前の座標で判断して
+        ビューが飛ぶ。理由は2つ:
+        (1) レイアウトに載せた直後のウィジェットは親が可視でもまだ hidden で、
+            QWidgetItem::isEmpty() が真になるためボックスレイアウトから無視される。
+            ジオメトリが (0,0) のままなので「内容の先頭」と読まれ、挿入のたびに
+            ビューが先頭へ戻る。show() を呼ぶまでレイアウトに載らない。
+        (2) QScrollArea が内側ウィジェットをリサイズしてスクロールバーの range を
+            更新するのは LayoutRequest を受けたときだけで、通常は次のイベントループ
+            まで遅延する。ここで同期的に送る。
+        block を渡すとそのブロックだけ確定させる（打鍵ごとに呼ぶ経路用）。
+        """
+        for b in (self.blocks if block is None else [block]):
+            if b.isHidden():
+                b.show()
+            b.settle_layout()
         self.column_layout.activate()
-        self.scroll.widget().layout().activate()
-        self.scroll.ensureWidgetVisible(widget, 0, 24)
+        QApplication.sendEvent(self.scroll, QEvent(QEvent.Type.LayoutRequest))
+        # inner のリサイズ結果を列レイアウトへ反映する（1回目は inner が伸びる前）。
+        self.column_layout.activate()
+
+    def _content_top(self, widget: QWidget) -> int:
+        """スクロール内容座標での widget の上端。"""
+        return widget.mapTo(self.scroll.widget(), QPoint(0, 0)).y()
+
+    def _scroll_to_show(self, top: int, bottom: int, margin: int) -> int:
+        """[top, bottom]（スクロール内容座標）が見えるよう最小限だけ動かす。
+
+        収まらないときは上端を優先する（続きより始まりが見えないほうが困る）。
+        戻り値はクランプ前の要求値。呼び出し側が「range がまだ足りなかった」ことを
+        検出して測り直すために使う。
+        """
+        bar = self.scroll.verticalScrollBar()
+        vh = self.scroll.viewport().height()
+        v = bar.value()
+        if bottom + margin > v + vh:
+            v = bottom + margin - vh
+        if top - margin < v:
+            v = top - margin
+        bar.setValue(v)                       # range 外は QAbstractSlider がクランプする
+        return v
+
+    def _block_of(self, widget: QWidget) -> Optional[BlockWidget]:
+        return next((b for b in self.blocks if b.isAncestorOf(widget)), None)
+
+    def _reveal(self, block: BlockWidget) -> None:
+        """ブロック全体を可視域へ（最小移動）。
+
+        ensureWidgetVisible は使わない。QTextEdit に対しては ImCursorRectangle
+        （キャレット矩形）を見るため、ブロック枠が画面外へはみ出していても
+        「見えている」と判定してしまう。
+        """
+        for _ in range(2):
+            self._settle_layout()
+            top = self._content_top(block)
+            if self._scroll_to_show(top, top + block.height(), REVEAL_MARGIN) <= (
+                self.scroll.verticalScrollBar().maximum()
+            ):
+                break                          # クランプされていない = 測り直し不要
+        # ビューポートに収まらないブロックは上端合わせになるので、末尾付近にある
+        # キャレットが画面外へ取り残される。見えないまま打つほうが困るので、
+        # そのブロック内を編集中ならキャレットを優先して見せ直す。
+        if block.height() + 2 * REVEAL_MARGIN > self.scroll.viewport().height():
+            focus = QApplication.focusWidget()
+            if isinstance(focus, (QTextEdit, QPlainTextEdit)) and block.isAncestorOf(focus):
+                self._reveal_caret(focus)
+
+    def _reveal_caret(self, editor: QWidget) -> None:
+        """キャレットを可視域へ（最小移動）。見えている間は何もしない。"""
+        block = self._block_of(editor)
+        # cursorRect() 自体が QTextDocument の遅延レイアウトを進めるので、1回目の
+        # settle 時点ではスクロール範囲がまだ足りず setValue が黙ってクランプされる
+        # ことがある（数千字を一度に貼り付けた場合）。伸びた range で測り直す。
+        for _ in range(2):
+            self._settle_layout(block)
+            rect = editor.cursorRect()
+            y = editor.viewport().mapTo(self.scroll.widget(), rect.topLeft()).y()
+            if self._scroll_to_show(y, y + rect.height(), CARET_MARGIN) <= (
+                self.scroll.verticalScrollBar().maximum()
+            ):
+                return
+
+    def _topmost_visible_block(self) -> Optional[BlockWidget]:
+        """画面最上部にかかっているブロック。"""
+        v = self.scroll.verticalScrollBar().value()
+        for b in self.blocks:
+            if self._content_top(b) + b.height() > v:
+                return b
+        return self.blocks[-1] if self.blocks else None
+
+    def _zoom_anchor(self) -> Optional[tuple]:
+        """ズーム前に「画面最上部に見えている文字」を覚える。
+
+        ブロックの上端ではなく文字位置を基準にする。ビューポートより高いブロックでは
+        上端が画面外にあり、そこからのピクセル距離は拡大縮小で伸び縮みするので、
+        上端を固定しても読んでいる行は流れてしまう。
+        """
+        block = self._topmost_visible_block()
+        if block is None:
+            return None
+        ed = block.content
+        # スクロールビューポートの上端に対応する、本文欄ローカルの座標。
+        # 説明欄しか見えていない位置なら y が負になり、先頭文字に丸められる。
+        point = ed.viewport().mapFrom(self.scroll.viewport(), QPoint(0, 0))
+        pos = ed.cursorForPosition(point).position()
+        return ed, pos, self._cursor_content_top(ed, pos) - self.scroll.verticalScrollBar().value()
+
+    def _cursor_content_top(self, editor: QWidget, pos: int) -> int:
+        cursor = QTextCursor(editor.document())
+        cursor.setPosition(min(pos, editor.document().characterCount() - 1))
+        return editor.viewport().mapTo(
+            self.scroll.widget(), editor.cursorRect(cursor).topLeft()
+        ).y()
+
+    def _restore_zoom_anchor(self, anchor: Optional[tuple]) -> None:
+        # 2回まわす。1回目の cursorRect() が本文の遅延レイアウトを進めるので、
+        # 2回目は確定した高さで測り直せる（1回だけだと数十px ずれる）。
+        if anchor is None:
+            return
+        editor, pos, keep = anchor
+        bar = self.scroll.verticalScrollBar()
+        for _ in range(2):
+            self._settle_layout()
+            want = self._cursor_content_top(editor, pos) - keep
+            if bar.value() == want:
+                break
+            bar.setValue(want)
+
+    def _on_caret_moved(self) -> None:
+        """入力・貼り付け・IME 変換でキャレットが動いたら追従する。"""
+        if self._loading:
+            return
+        editor = self.sender()
+        if editor is not None and self._block_of(editor) is not None:
+            self._reveal_caret(editor)
 
     def _block_is_empty(self, block: BlockWidget) -> bool:
         d = block.to_dict()
@@ -1717,7 +1909,7 @@ class EditorWindow(QMainWindow):
         self._rebuild_tab_order()
         if saved is not None and QApplication.focusWidget() is not saved:
             saved.setFocus(Qt.FocusReason.OtherFocusReason)
-        self._reveal(saved or block.content)
+        self._reveal(block)
 
     def action_delete_current_block(self) -> None:
         QApplication.inputMethod().commit()
@@ -1732,6 +1924,7 @@ class EditorWindow(QMainWindow):
                 block.load_from_dict({})
                 self._mark_dirty()
                 block.content.setFocus()
+                self._reveal(block)
             return
         if not self._confirm_delete_block(block):
             return
@@ -1739,14 +1932,22 @@ class EditorWindow(QMainWindow):
             i = self.blocks.index(block)
         except ValueError:
             return
-        neighbor = self.blocks[i + 1] if i + 1 < len(self.blocks) else self.blocks[i - 1]
+        below = i + 1 < len(self.blocks)
+        neighbor = self.blocks[i + 1] if below else self.blocks[i - 1]
         # 破棄より先にフォーカスを移す（後だと勝手に別ブロックへ飛んでビューが跳ねる）。
         neighbor.content.setFocus()
         self.blocks.pop(i)
         self._destroy_block(block)
         self._rebuild_tab_order()
         self._mark_dirty()
-        self._reveal(neighbor.content)
+        if not below:
+            # 末尾を消して「上」のブロックへ戻る場合。キャレットを末尾＝消したブロックが
+            # あった位置へ置く。既定の位置（多くは先頭）のままだと、そのブロックの
+            # 頭までビューが巻き戻る。
+            neighbor.content.moveCursor(QTextCursor.MoveOperation.End)
+        # 削除点より上は動かないので、スクロール値は据え置いてキャレットだけ保証する
+        # （ブロック全体を見せにいくと、隣が長いときに大きく飛ぶ）。
+        self._reveal_caret(neighbor.content)
 
     def action_insert_block_below(self) -> None:
         QApplication.inputMethod().commit()
@@ -1829,6 +2030,11 @@ class EditorWindow(QMainWindow):
             self._loading = False
         # _clear_blocks で全ブロックを破棄しているのでチェーンを張り直す。
         self._rebuild_tab_order()
+        # 開いたファイルは必ず先頭から見せる（前のファイルのスクロール値が残ると、
+        # 新しいファイルが途中から開く）。同じフレーム内でジオメトリとスクロール
+        # 範囲も確定させておく。
+        self._settle_layout()
+        self.scroll.verticalScrollBar().setValue(0)
         self._saved_snapshot = self._snapshot()
         self.dirty = False
         self._update_status()
@@ -1973,8 +2179,12 @@ class EditorWindow(QMainWindow):
         pt = max(FONT_MIN_PT, min(FONT_MAX_PT, pt))
         if pt == self.base_pt:
             return
+        # 全ブロックの高さが変わるので、読んでいた行を画面上の同じ y に留める。
+        # 記録は _apply_fonts の前でないと意味がない。
+        anchor = self._zoom_anchor()
         self.base_pt = pt
         self._apply_fonts()
+        self._restore_zoom_anchor(anchor)
         self.format_bar.reposition()
 
     def action_insert_en_dash(self) -> None:
