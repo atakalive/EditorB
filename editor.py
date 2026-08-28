@@ -12,7 +12,6 @@ from typing import Optional
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
-    QCursor,
     QFont,
     QFontMetrics,
     QFontMetricsF,
@@ -2245,10 +2244,15 @@ class EditorWindow(QMainWindow):
         # QDragLeaveEvent は QDropEvent の派生ではなく mimeData() を持たないので、
         # この判定を最初に置く。
         if ev.type() == QEvent.Type.DragLeave:
-            # ウィンドウ内の子ウィジェット境界を跨いだだけなら維持する（その直後に
-            # マウスが静止すると DragMove が来ず、誤って消えてしまうため）。
-            if not self.frameGeometry().contains(QCursor.pos()):
-                self._drop_hide_timer.start()
+            # 隠すのは遅延させる。ウィンドウ内で配送先を跨ぐと旧ターゲットへ
+            # DragLeave、新ターゲットへ DragEnter/DragMove が同一ディスパッチで
+            # 連続発行され、DragEnter 側が _show_drop_overlay 経由で必ずタイマを
+            # stop する（120ms 以内）。よって内部境界跨ぎでは暗幕は消えない。一方
+            # Esc キャンセルやウィンドウ外への離脱では後続の DragEnter が来ないので
+            # 遅延後に暗幕が畳まれる。ゆえに無条件に start してよい（カーソル位置で
+            # ガードすると Esc キャンセル時に暗幕が残る——枠内のまま DragLeave が
+            # 来て、以後 DragEnter/Drop が来ないため）。
+            self._drop_hide_timer.start()
             return False
         paths = _local_files(ev.mimeData())
         if not paths:
