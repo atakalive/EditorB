@@ -12,12 +12,15 @@ from typing import Optional
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QFontMetricsF,
     QIntValidator,
     QKeySequence,
+    QPainter,
     QPalette,
+    QPen,
     QShortcut,
     QTextBlock,
     QTextBlockFormat,
@@ -69,8 +72,17 @@ INDENT_MAX = 6
 WORD_INDENT_PT = 24
 DIRTY_DEBOUNCE_MS = 300
 BAR_DELAY_MS = 120
+DROP_HIDE_DELAY_MS = 120
 REVEAL_MARGIN = 24   # ブロック表示時の上下マージン
 CARET_MARGIN = 8     # キャレット表示時の上下マージン
+
+# ドラッグ＆ドロップでアプリ級イベントフィルタが横取りするイベント種別。
+_DND_TYPES = (
+    QEvent.Type.DragEnter,
+    QEvent.Type.DragMove,
+    QEvent.Type.Drop,
+    QEvent.Type.DragLeave,
+)
 
 # 文字数カウントから除外する文字。toPlainText() は U+2028 / U+2029 を "\n" に
 # 正規化するので、ここで指定するのは改行と OBJECT REPLACEMENT CHARACTER だけでよい。
@@ -982,6 +994,78 @@ class RichTextEdit(QTextEdit):
         super().keyPressEvent(e)
 
 
+def _local_files(mime: QMimeData) -> list[Path]:
+    """ドロップされた mime からローカルファイルのパスだけを取り出す。"""
+    if not mime.hasUrls():
+        return []
+    return [Path(u.toLocalFile()) for u in mime.urls() if u.isLocalFile()]
+
+
+def _first_editorb(paths: list[Path]) -> Optional[Path]:
+    """先頭の .editorb を返す（無ければ None）。
+
+    DragMove ごとに走るホットパスなので is_file() 等の stat は行わない
+    （ネットワークパスで重い）。実体の検査は Drop 時と _open_path に任せる。
+    """
+    for p in paths:
+        if p.suffix.lower() == FILE_EXT:
+            return p
+    return None
+
+
+class DropOverlay(QWidget):
+    """ドラッグ中に全面へ被せる「ここにドロップして開く」表示。
+
+    FormatBar と同じく central widget の子にする。central は QMainWindow の
+    クライアント領域全体なので、ヘッダからステータスバーまで覆える。
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        # 必須。これが無いとオーバーレイ自身が childAt() に引っかかり、
+        # ドラッグイベントの配送先を掻き回す。
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.file_name: str = ""
+        self.hide()
+
+    def set_file(self, name: str) -> None:
+        if name != self.file_name:
+            self.file_name = name
+            self.update()
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        painter.fillRect(rect, QColor(30, 30, 30, 210))
+        painter.setPen(QPen(QColor("#569cd6"), 2, Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect.adjusted(20, 20, -20, -20), 10, 10)
+
+        # central のフォントを継承するので、ズーム（_apply_fonts）に自動追従する。
+        title_font = QFont(self.font())
+        title_font.setPointSize(self.font().pointSize() + 4)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(title_font)
+        line_h = QFontMetrics(title_font).height()
+        painter.setPen(QColor("#e6e6e6"))
+        painter.drawText(
+            rect.translated(0, -line_h // 2),
+            Qt.AlignmentFlag.AlignCenter,
+            "ここにドロップして開く",
+        )
+
+        if self.file_name:
+            painter.setFont(self.font())
+            painter.setPen(QColor("#9a9a9a"))
+            painter.drawText(
+                rect.translated(0, line_h),
+                Qt.AlignmentFlag.AlignCenter,
+                self.file_name,
+            )
+
+
 class FormatBar(QFrame):
     """テキスト選択時に浮かぶ書式ツールバー。
 
@@ -1497,6 +1581,18 @@ class EditorWindow(QMainWindow):
         self._dirty_timer.setInterval(DIRTY_DEBOUNCE_MS)
         self._dirty_timer.timeout.connect(self._flush_dirty)
 
+        # ドラッグ＆ドロップ。ウィンドウ全体で受けるため、配送先ウィジェットに
+        # 依らずアプリ級イベントフィルタ（eventFilter）で横取りする。
+        # setAcceptDrops(True) が無いとヘッダやブロック間の余白の上ではそもそも
+        # ドラッグイベントが誰にも配送されず、フィルタも呼ばれない。
+        self.setAcceptDrops(True)
+        self._pending_drop: Optional[Path] = None
+        self._drop_busy: bool = False
+        self._drop_hide_timer = QTimer(self)
+        self._drop_hide_timer.setSingleShot(True)
+        self._drop_hide_timer.setInterval(DROP_HIDE_DELAY_MS)
+        self._drop_hide_timer.timeout.connect(self._hide_drop_overlay)
+
         self._build_ui()
         self._build_shortcuts()
         self._apply_fonts()
@@ -1579,6 +1675,8 @@ class EditorWindow(QMainWindow):
 
         # フローティング書式バー（central widget の子。トップレベルにしない）
         self.format_bar = FormatBar(central)
+        # ドロップ用オーバーレイ（同じく central widget の子）
+        self.drop_overlay = DropOverlay(central)
         self.scroll.verticalScrollBar().valueChanged.connect(
             lambda _v=0: self.format_bar.reposition()
         )
@@ -1997,14 +2095,17 @@ class EditorWindow(QMainWindow):
         )
         if not path_str:
             return
-        path = Path(path_str)
+        self._open_path(Path(path_str))
+
+    def _open_path(self, path: Path) -> bool:
+        """ファイルを読み込んで表示する。成功なら True / 警告表示後 False。"""
         try:
             with path.open("r", encoding="utf-8") as f:
                 raw = json.load(f)
             data = _validate_data(raw)
         except (OSError, json.JSONDecodeError, ValueError) as e:
             QMessageBox.warning(self, APP_NAME, f"ファイルを開けませんでした:\n{e}")
-            return
+            return False
         self._load_data(data)
         self.current_path = path
         self.dirty = False
@@ -2012,6 +2113,7 @@ class EditorWindow(QMainWindow):
         self._update_window_title()
         if self.blocks:
             self.blocks[0].content.setFocus()
+        return True
 
     def action_save(self) -> bool:
         if self.current_path is None:
@@ -2112,6 +2214,10 @@ class EditorWindow(QMainWindow):
             self.format_bar.detach()
 
     def eventFilter(self, obj: QObject, ev: QEvent) -> bool:  # noqa: N802
+        # 同じイベントは QWidgetWindow にも飛ぶので、ウィジェットへ転送された
+        # ほうだけを扱う（短絡評価で型を確認してから window() を呼ぶ）。
+        if ev.type() in _DND_TYPES and isinstance(obj, QWidget) and obj.window() is self:
+            return self._handle_dnd(ev)
         if ev.type() == QEvent.Type.Wheel and (
             ev.modifiers() & Qt.KeyboardModifier.ControlModifier
         ):
@@ -2126,7 +2232,90 @@ class EditorWindow(QMainWindow):
             self.column.setFixedWidth(max(200, w))
         if ev.type() in (QEvent.Type.Resize, QEvent.Type.Move) and obj is self:
             self.format_bar.reposition()
+        # オーバーレイの追従は central 自身の Resize で行う。self の Resize 時点では
+        # QMainWindow のレイアウトが済んでおらず central.rect() が旧サイズを指しうる。
+        if ev.type() == QEvent.Type.Resize and obj is self.centralWidget():
+            if self.drop_overlay.isVisible():
+                self.drop_overlay.setGeometry(self.centralWidget().rect())
         return super().eventFilter(obj, ev)
+
+    # ---------- drag & drop ----------
+    def _handle_dnd(self, ev: QEvent) -> bool:
+        """True を返すと配送先ウィジェットにはイベントが渡らない。"""
+        # QDragLeaveEvent は QDropEvent の派生ではなく mimeData() を持たないので、
+        # この判定を最初に置く。
+        if ev.type() == QEvent.Type.DragLeave:
+            # ウィンドウ内の子ウィジェット境界を跨いだだけなら維持する（その直後に
+            # マウスが静止すると DragMove が来ず、誤って消えてしまうため）。
+            if not self.frameGeometry().contains(QCursor.pos()):
+                self._drop_hide_timer.start()
+            return False
+        paths = _local_files(ev.mimeData())
+        if not paths:
+            return False           # テキストの内部ドラッグ等は完全素通し
+        path = _first_editorb(paths)
+        if path is None or self._drop_busy:
+            self._hide_drop_overlay()
+            ev.ignore()
+            return True
+        if ev.type() == QEvent.Type.Drop:
+            if path.is_dir():
+                # `folder.editorb` のようなディレクトリを弾く（stat は Drop 時のみ）。
+                self._hide_drop_overlay()
+                ev.ignore()
+                return True
+            self._hide_drop_overlay()
+            # Drop 受理と同時に立てる。singleShot 実行までの隙間に来た 2 個目の
+            # Drop を上の _drop_busy 分岐で弾くため。
+            self._drop_busy = True
+            # acceptProposedAction() は使わない。エクスプローラの同一ドライブ内
+            # ドラッグは既定が MoveAction で、そのまま受理すると元ファイルが消える。
+            ev.setDropAction(Qt.DropAction.CopyAction)
+            ev.accept()
+            self._pending_drop = path
+            # Windows の OLE ドロップはドロップ元アプリのネストしたループの中で
+            # 走る。その中でモーダルを出すとドロップ元ごと固まるので次の
+            # イベントループへ逃がす。
+            QTimer.singleShot(0, self._run_pending_drop)
+            return True
+        # DragEnter を受理しないと Drop は永久に来ない。
+        self._show_drop_overlay(path)
+        ev.setDropAction(Qt.DropAction.CopyAction)
+        ev.accept()
+        return True
+
+    def _show_drop_overlay(self, path: Path) -> None:
+        self._drop_hide_timer.stop()
+        ov = self.drop_overlay
+        if ov.isVisible() and ov.file_name == path.name:
+            return                  # DragMove 毎の再表示・再 raise はしない
+        ov.set_file(path.name)
+        ov.setGeometry(ov.parentWidget().rect())
+        ov.show()
+        ov.raise_()                 # FormatBar が出ていてもその上へ
+
+    def _hide_drop_overlay(self) -> None:
+        self.drop_overlay.hide()
+
+    def _run_pending_drop(self) -> None:
+        path = self._pending_drop
+        self._pending_drop = None
+        if path is None:
+            self._drop_busy = False
+            return
+        try:
+            # エクスプローラからフォーカスを取り戻してからダイアログを出す。
+            self.activateWindow()
+            self.raise_()
+            decision = self._confirm_discard()
+            if decision is None:
+                return
+            if decision is True:
+                if not self.action_save():
+                    return
+            self._open_path(path)
+        finally:
+            self._drop_busy = False
 
     def closeEvent(self, e) -> None:  # noqa: N802
         decision = self._confirm_discard()
