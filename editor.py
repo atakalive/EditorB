@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import re
@@ -15,6 +16,7 @@ from PySide6.QtGui import (
     QFont,
     QFontMetrics,
     QFontMetricsF,
+    QIcon,
     QIntValidator,
     QKeySequence,
     QPainter,
@@ -2333,15 +2335,42 @@ class EditorWindow(QMainWindow):
         e.accept()
 
 
+def _startup_path(args: list[str]) -> Optional[Path]:
+    """コマンドライン引数から開くべき .editorb ファイルを 1 つ返す。
+
+    Explorer 関連付けの "%1" 単一引数と run.bat の %* 転送を想定。
+    「拡張子が .editorb の最初の引数」を選ぶことで、-style Fusion のような
+    値付き Qt/Python オプションが混ざっても Fusion をファイル名と誤認せず、
+    - で始まる .editorb ファイル名も正しく拾える。見つからなければ None
+    （新規ドキュメントで起動）。ステータスバーのフルパス表示のため絶対パスに
+    正規化して返す（.resolve() は非 strict なので未存在パスでも例外にならない）。
+    """
+    for a in args:
+        if Path(a).suffix.lower() == FILE_EXT:
+            return Path(a).resolve()
+    return None
+
+
 def main() -> int:
+    startup = _startup_path(sys.argv[1:])
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Ataka.EditorB")
+        except (AttributeError, OSError):
+            pass
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName(APP_NAME)
     app.setStyleSheet(QSS)
     base = QFont(FONT_FAMILY.split(",")[0].strip(), FONT_DEFAULT_PT)
     app.setFont(base)
+    icon = Path(__file__).parent / "assets" / "editorb.ico"
+    if icon.exists():
+        app.setWindowIcon(QIcon(str(icon)))
     win = EditorWindow()
     win.show()
+    if startup:
+        win._open_path(startup)
     return app.exec()
 
 
