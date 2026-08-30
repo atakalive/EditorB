@@ -188,7 +188,7 @@ QLabel#count {
     color: #888;
 }
 QLabel#count[over="true"] {
-    color: #e0a050;
+    color: #888;
 }
 QLabel#slash, QLabel#unit {
     color: #666;
