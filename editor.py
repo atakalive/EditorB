@@ -371,6 +371,13 @@ class AutoResizingTextEdit(QPlainTextEdit):
         if e.preeditString() or e.commitString():
             self.caret_moved.emit()
 
+    def contextMenuEvent(self, e) -> None:  # noqa: N802
+        menu = self.createStandardContextMenu(e.pos())
+        menu.addSeparator()
+        menu.addAction("ブロックをコピー", lambda: _copy_block_of(self))
+        menu.exec(e.globalPos())
+        menu.deleteLater()
+
     def _adjust_height(self) -> None:
         doc = self.document()
         layout = doc.documentLayout()
@@ -973,6 +980,8 @@ class RichTextEdit(QTextEdit):
     def contextMenuEvent(self, e) -> None:  # noqa: N802
         menu = self.createStandardContextMenu(e.pos())
         menu.addSeparator()
+        menu.addAction("ブロックをコピー", lambda: _copy_block_of(self))
+        menu.addSeparator()
         menu.addAction("書式なしで貼り付け\tCtrl+Shift+V", self.paste_plain)
         sub: QMenu = menu.addMenu("書式")
         for name, label, tip, _obj in self.COMMANDS:
@@ -1424,6 +1433,39 @@ class BlockWidget(QFrame):
         d["show_count"] = self.cb_show.isChecked()
         return d
 
+    def block_mime(self) -> QMimeData:
+        """タイトル(description)＋本文(content)を Word 互換 HTML とプレーンの両方で載せた MimeData。
+
+        クリップボードには触れない（テスト容易のため副作用なし）。呼び出し側 _copy_block_of が
+        QApplication.clipboard().setMimeData に渡す。
+        """
+        title = self.description.toPlainText().rstrip()
+        body_text = self.content.toPlainText().rstrip()
+        plain = "\n\n".join(p for p in (title, body_text) if p)
+
+        # ⚠️ 本文 doc を clone して position 0 にタイトルを差し込む方式は採らない。本文先頭が
+        #    箇条書き/インデント段落だと、タイトルがその block format を継承して「箇条書きの
+        #    タイトル」になる（sanitize_document は既存 block format を保持する）。新規 doc に
+        #    既定書式でタイトルを入れてから本文を fragment で連結する。
+        src = self.content.document()
+        doc = QTextDocument()
+        doc.setDefaultFont(src.defaultFont())
+        doc.setIndentWidth(src.indentWidth())
+        cur = QTextCursor(doc)
+        if title:
+            cur.insertText(title)
+            cur.insertBlock()
+        cur.insertFragment(QTextDocumentFragment(src))
+        sanitize_document(doc, map_margins=False)
+        # ⚠️ クリップボード出力経路なので StartFragment マーカーは剥がさない
+        #    （setHtml で Qt が CF_HTML のバイトオフセットを再計算する。to_dict の保存経路とは違う）。
+        html = _word_ready_html(QTextDocumentFragment(doc).toHtml())
+
+        mime = QMimeData()
+        mime.setText(plain)
+        mime.setHtml(html)
+        return mime
+
     def load_from_dict(self, d: dict) -> None:
         self.description.blockSignals(True)
         self.content.blockSignals(True)
@@ -1471,6 +1513,24 @@ class BlockWidget(QFrame):
         finally:
             doc.setUndoRedoEnabled(True)
         doc.setModified(False)
+
+
+def _copy_block_of(widget: QWidget) -> None:
+    """右クリックされたエディタが属する BlockWidget を親方向に辿り、その内容をコピーする。
+
+    本文欄(RichTextEdit)・タイトル欄(AutoResizingTextEdit)のコンテキストメニューから共用する。
+    """
+    # 既存のブロック操作(move/delete/insert)と同じく IME 未確定を確定させてから読む。
+    QApplication.inputMethod().commit()
+    node = widget
+    while node is not None and not isinstance(node, BlockWidget):
+        node = node.parentWidget()
+    if node is None:
+        return
+    # 空ブロックでクリップボードを空データで上書きしない。
+    if not node.description.toPlainText().strip() and not node.content.toPlainText().strip():
+        return
+    QApplication.clipboard().setMimeData(node.block_mime())
 
 
 def _sanitize_filename(name: str) -> str:
