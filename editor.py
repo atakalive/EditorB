@@ -187,9 +187,6 @@ QFrame#footer {
 QLabel#count {
     color: #888;
 }
-QLabel#count[over="true"] {
-    color: #888;
-}
 QLabel#slash, QLabel#unit {
     color: #666;
 }
@@ -312,12 +309,6 @@ QMenu::separator {
     margin: 4px 6px;
 }
 """
-
-
-def _repolish(w: QWidget) -> None:
-    w.style().unpolish(w)
-    w.style().polish(w)
-    w.update()
 
 
 class AutoResizingTextEdit(QPlainTextEdit):
@@ -1311,7 +1302,9 @@ class BlockWidget(QFrame):
 
         self.lbl_count = QLabel("0")
         self.lbl_count.setObjectName("count")
-        self.lbl_count.setProperty("over", False)
+        # 超過時は <b> で太字にする。QSS 適用ラベルでは setFont / QSS の font-weight が
+        # ズーム時の setFont 再適用で失われるため、テキスト自体に太字を埋め込む。
+        self.lbl_count.setTextFormat(Qt.TextFormat.RichText)
 
         self.lbl_slash = QLabel("/")
         self.lbl_slash.setObjectName("slash")
@@ -1375,7 +1368,6 @@ class BlockWidget(QFrame):
         self.lbl_count.show()
         self.lbl_unit.show()
         self.ed_limit.show()
-        self.lbl_count.setText(str(n))
 
         if limit > 0:
             self.lbl_slash.show()
@@ -1384,9 +1376,8 @@ class BlockWidget(QFrame):
             self.lbl_slash.hide()
             over = False
 
-        if self.lbl_count.property("over") != over:
-            self.lbl_count.setProperty("over", over)
-            _repolish(self.lbl_count)
+        # 超過時のみ太字（色は #888 のまま）。リッチテキストで確実に描画する。
+        self.lbl_count.setText(f"<b>{n}</b>" if over else str(n))
 
     def settle_layout(self) -> None:
         """内側 -> 外側の順にレイアウトを確定させ、sizeHint を最新にする。
